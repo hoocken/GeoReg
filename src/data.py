@@ -25,7 +25,7 @@ class ISLES2024Dataset(Dataset):
         self.root = Path(config.root)
 
         # get ids
-        self.id_list = self.root.glob('CTATr/sub-stroke*_0000.nii.gz')
+        self.id_list = self.root.glob('CTATr/sub-scan*_0000.nii.gz')
         self.id_list = [p.name.split('_')[0] for p in self.id_list]
         self.id_list.sort()
 
@@ -36,11 +36,11 @@ class ISLES2024Dataset(Dataset):
         id_ = self.id_list[idx]
 
         # get paths
-        dsa_path = self.root / 'DSATr' / id_
-        dsa_msk_path = self.root / 'MAP_maskTr' / id_
-        dsa_metadata_path = self.root / 'DSA_arteriesTr' / id_
+        fluor_path = self.root / 'FTr' / id_
+        fluor_msk_path = self.root / 'F_maskTr' / id_
+        fluor_metadata_path = self.root / 'F_metadataTr' / id_
         cta_path = self.root / 'CTATr' / f'{id_}_0000.nii.gz'
         cta_msk_path = self.root / 'CTA_skullTr' / f'{id_}.nii.gz'
 
-        return {"DSA": dsa_path, "DSA_mask": dsa_msk_path, "DSA_metadata": dsa_metadata_path,
+        return {"Fluor": fluor_path, "Fluor_mask": fluor_msk_path, "Fluor_metadata": fluor_metadata_path,
                 "CTA": cta_path, "CTA_mask": cta_msk_path}

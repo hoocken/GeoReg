@@ -9,6 +9,7 @@ import shutil
 import time
 import torch
 import torch.nn as nn
+import PIL.ImageOps
 
 from diffdrr.data import read
 from diffdrr.drr import convert, DRR
@@ -16,12 +17,12 @@ from diffdrr.metrics import *
 from functools import wraps
 from monai.losses.dice import *
 from pathlib import Path
-from pytorch3d.transforms import so3_log_map
 from scipy.ndimage import label
 from skimage.transform import resize
 from torch.optim import *
 from torch.optim.lr_scheduler import *
 from .data import sitk_to_numpy
+from PIL import Image
 
 # try to import bilateral_filter_layer, fall back to cv2 if not available
 try:
@@ -47,7 +48,7 @@ def time_it(func):
     return wrapper
 
 
-class BiplanarReg(nn.Module):
+class FluoresenceReg(nn.Module):
     def __init__(self, config, id_dict):
         super().__init__()
         self.config = config
@@ -68,22 +69,22 @@ class BiplanarReg(nn.Module):
         self.image_dir.mkdir(exist_ok=True)
 
         # load data
-        paths = self._get_dsa_paths(config.timestamp, id_dict)
+        paths = self._get_fluor_paths(id_dict)
         cta = read(id_dict['CTA'], id_dict['CTA_mask'], labels=[0, 1])
-        self.dsa, self.dsa_mask = self._prepare_dsa_data(paths)
+        self.fluor, self.fluor_mask = self._prepare_fluor_data(paths)
 
         self.dists = {}
         self.drrs = {}
         self.params = nn.ParameterDict()
-        for v in ['lat', 'pa']:
-            with open(paths[2][v]) as f:
-                metadata = json.load(f)
 
-            self.dists[v] = metadata['d_source_to_detector'] - config.detector_dist
-            self.drrs[v] = DRR(cta, sdd=metadata['d_source_to_detector'],
-                               height=config.detector_size[0], delx=config.detector_spacing[0],
-                               stop_gradients_through_grid_sample=True).to(self.device)
-            self.params[v] = self._initialize_params(v)
+        with open(paths[2]) as f:
+            metadata = json.load(f)
+
+        self.dists = metadata['DistanceSourceToDetector'] - config.detector_dist # what is detector_dist?
+        self.drrs = DRR(cta, sdd=metadata['DistanceSourceToDetector'],
+                            height=config.detector_size[0], width=config.detector_size[1], delx=config.detector_spacing[0],
+                            stop_gradients_through_grid_sample=True).to(self.device)
+        self.params = self._initialize_params()
 
         # loss
         self.criterion = eval(config.criterion_img)(**(config.criterion_img_kwargs or {}))
@@ -94,83 +95,72 @@ class BiplanarReg(nn.Module):
         self.optimizer = eval(config.optimizer)(self.parameters(), **(self.config.optimizer_kwargs or {}))
         self.scheduler = eval(config.scheduler)(self.optimizer, **(config.scheduler_kwargs or {}))
         
-
-    def _get_dsa_paths(self, timestamp, id_dict):
-        """Get DSA and camera file paths based on DSA type."""
-        suffix_map = {"pre": ["_a", "_b"],
-                      "post": ["_c", "_d"]}
-
-        suffixes = suffix_map['pre'] if 'pre' in timestamp else suffix_map['post']
-        img_paths = {'lat': str(id_dict['DSA']) + suffixes[0] + '_0000.nii.gz',
-                     'pa': str(id_dict['DSA']) + suffixes[1] + '_0000.nii.gz'}
-        msk_paths = {'lat': str(id_dict['DSA_mask']) + suffixes[0] + '.nii.gz',
-                     'pa': str(id_dict['DSA_mask']) + suffixes[1] + '.nii.gz'}
-        meta_paths = {'lat': str(id_dict['DSA_metadata']) + suffixes[0] + '.json',
-                      'pa': str(id_dict['DSA_metadata']) + suffixes[1] + '.json'}
+    def _get_fluor_paths(self, id_dict):
+        img_paths = str(id_dict['Fluor']) + '.png'
+        msk_paths = str(id_dict['Fluor_mask']) + '.png'
+        meta_paths = str(id_dict['Fluor_metadata']) + '.json'
         return img_paths, msk_paths, meta_paths
-    
-    def _prepare_dsa_data(self, paths):         
-        imgs = {}
-        msks = {}
-   
-        for v in ['lat', 'pa']:
-            # prepare image
-            img, _, _ = sitk_to_numpy(paths[0][v])
-            img = np.max(img, axis=0)
 
-            # calculate metrics over valid region
-            img_nonzero = np.sum(img, axis=0) != 0
-            img_valid = img[:, img_nonzero]
-            vmin, vmax = np.percentile(img_valid, [25, 75])
-            if vmin == vmax:
-                vmax += 40
+    def _prepare_fluor_data(self, paths):
+        imgs, msks = None, None
 
-            msk, _, _ = sitk_to_numpy(paths[1][v])
+        img = Image.open(paths[0]).convert('L')
+        img = PIL.ImageOps.invert(img)
+        img = np.asarray(img)
 
-            # get largest mask component
-            labeled, _ = label(msk[0])
-            component_sizes = np.bincount(labeled.ravel())[1:]
-            largest_component = np.argmax(component_sizes) + 1
-            msk = (labeled == largest_component).astype(float)
+        # calculate metrics over valid region
+        vmin, vmax = np.percentile(img, [25, 75])
+        if vmin == vmax:
+            vmax += 40
 
-            # norm
-            img = np.clip(img, vmin, vmax)
-            img -= np.min(img)
+        msk = Image.open(paths[1]).convert('L')
+        msk = np.asarray(msk)
 
-            # reshape
-            if img.shape != self.config.detector_size:
-                img = resize(img, self.config.detector_size, preserve_range=True, anti_aliasing=True)
-                msk = resize(msk, self.config.detector_size, preserve_range=True, anti_aliasing=False)
+        # get largest mask component
+        labeled, _ = label(msk)
+        component_sizes = np.bincount(labeled.ravel())[1:]
+        largest_component = np.argmax(component_sizes) + 1
+        msk = (labeled == largest_component).astype(float)
 
-            # filter - use bilateral_filter_layer if available, otherwise cv2
-            if HAS_BILATERAL_LAYER and self.layer is not None:
-                img = torch.tensor(img, device=self.device, dtype=torch.float32)[None, None, None]
-                msk_tensor = torch.tensor(msk, device=self.device, dtype=torch.float32)[None, None]
-                with torch.no_grad():
-                    img = self.layer(img)[:, :, 0] * msk_tensor
-                imgs[v] = img
-                msks[v] = msk_tensor
-            else:
-                img = cv2.bilateralFilter(img.astype(np.float32), *self.config.sigmas)
-                img *= msk
-                imgs[v] = torch.tensor(img, device=self.device, dtype=torch.float32)[None, None]
-                msks[v] = torch.tensor(msk, device=self.device, dtype=torch.float32)[None, None]
+        # norm
+        img = np.clip(img, vmin, vmax)
+        img -= np.min(img)
+
+
+        # reshape
+        if img.shape != self.config.detector_size:
+            img = resize(img, self.config.detector_size, preserve_range=True, anti_aliasing=True)
+            msk = resize(msk, self.config.detector_size, preserve_range=True, anti_aliasing=False)
+
+        # filter - use bilateral_filter_layer if available, otherwise cv2
+        if HAS_BILATERAL_LAYER and self.layer is not None:
+            img = torch.tensor(img, device=self.device, dtype=torch.float32)[None, None, None]
+            msk_tensor = torch.tensor(msk, device=self.device, dtype=torch.float32)[None, None]
+            with torch.no_grad():
+                img = self.layer(img)[:, :, 0] * msk_tensor
+            imgs = img
+            msks = msk_tensor
+        else:
+            img = cv2.bilateralFilter(img.astype(np.float32), *self.config.sigmas)
+            img *= msk
+            imgs = torch.tensor(img, device=self.device, dtype=torch.float32)[None, None]
+            msks = torch.tensor(msk, device=self.device, dtype=torch.float32)[None, None]
 
         return imgs, msks
-
-    def _initialize_params(self, view):    
-        rot_init = [[90, 0, 0]] if view == 'lat' else [[0, 0, 0]]    
-        tra_init = [[0, self.dists[view], 0]]
+    
+    def _initialize_params(self):    
+        rot_init = [[0, 0, 0]]    
+        tra_init = [[0, self.dists, 0]]
 
         rot_init = torch.tensor(rot_init, device=self.device, dtype=torch.float32) / 180 * torch.pi
         tra_init = torch.tensor(tra_init, device=self.device, dtype=torch.float32) / self.config.multiplier
 
         return nn.ParameterList([nn.Parameter(rot_init), nn.Parameter(tra_init)])
 
-    def _extract_parameters(self, mode, to_cpu=True, to_list=True):
+    def _extract_parameters(self, to_cpu=True, to_list=True):
         """Extract rotation and translation parameters as lists."""
-        rot = self.params[mode][0]
-        tra = self.params[mode][1] * self.config.multiplier
+        rot = self.params[0]
+        tra = self.params[1] * self.config.multiplier
 
         if to_cpu:
             rot, tra = rot.detach().cpu(), tra.detach().cpu()
@@ -178,60 +168,41 @@ class BiplanarReg(nn.Module):
             rot, tra = rot.tolist(), tra.tolist()
         return rot, tra
     
-    def _geodesic_distance_so3(self):
-        rots = []
-        for v in ['lat', 'pa']:
-            rot, tra = self._extract_parameters(v, to_cpu=False, to_list=False)
-            pose = convert(rot, tra, parameterization='euler_angles', convention='ZYX')
-            rots.append(pose.matrix[0, :3, :3])
-
-        # calculate geodesic distance
-        R_rel = rots[0].T @ rots[1]
-        log_R_rel = so3_log_map(R_rel[None])
-
-        return torch.norm(log_R_rel[0])
-    
     def _compute_loss(self):
-        ncc_losses = []
-        dsc_losses = []
+        rot, tra = self._extract_parameters(False, False)
+        estimate = self.drrs(rot, tra, parameterization='euler_angles',
+                                convention='ZYX', mask_to_channels=True)
+        # ncc loss
+        ncc_loss = -self.criterion(self.fluor, estimate.sum(dim=1, keepdim=True))
 
-        for v in ['lat', 'pa']:
-            rot, tra = self._extract_parameters(v, False, False)
-            estimate = self.drrs[v](rot, tra, parameterization='euler_angles',
-                                    convention='ZYX', mask_to_channels=True)
-        
-            # ncc loss
-            ncc_losses.append(-self.criterion(self.dsa[v], estimate.sum(dim=1, keepdim=True)))
+        # dice loss
+        msk_target = (self.fluor_mask > 0).float()
+        estimate_pred = torch.sigmoid(estimate[:, 1:2]) # this should pick the second channel, bcs of mask_to_channels=True
+        dsc_loss = self.dice_loss(estimate_pred, msk_target)
 
-            # dice loss
-            msk_target = (self.dsa_mask[v] > 0).float()
-            estimate_pred = torch.sigmoid(estimate[:, 1:2])
-            dsc_losses.append(self.dice_loss(estimate_pred, msk_target))
-
-        return ncc_losses, dsc_losses
+        return ncc_loss, dsc_loss
 
     def _plot(self, ncc_losses, dsc_losses):
         """Save comparison plot of ground truth DSA and current estimates."""
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        fig, axes = plt.subplots(2, 1, figsize=(12, 5))
 
-        for idx, v in enumerate(['lat', 'pa']):
-            # compute estimate
-            rot, tra = self._extract_parameters(v, to_cpu=False, to_list=False)
-            estimate = self.drrs[v](rot, tra, parameterization='euler_angles',
-                                    convention='ZYX', mask_to_channels=True)
-            estimate = estimate.sum(dim=1, keepdim=True)
+        # compute estimate
+        rot, tra = self._extract_parameters(to_cpu=False, to_list=False)
+        estimate = self.drrs(rot, tra, parameterization='euler_angles',
+                                convention='ZYX', mask_to_channels=True)
+        estimate = estimate.sum(dim=1, keepdim=True)
 
-            # plot ground truth DSA
-            dsa_np = self.dsa[v].squeeze().detach().cpu().numpy()
-            axes[0, idx].imshow(dsa_np, cmap='gray')
-            axes[0, idx].set_title(f'DSA {v.upper()}')
-            axes[0, idx].axis('off')
+        # plot ground truth DSA
+        dsa_np = self.fluor.squeeze().detach().cpu().numpy()
+        axes[0].imshow(dsa_np, cmap='gray')
+        axes[0].set_title(f'fluor')
+        axes[0].axis('off')
 
-            # plot current estimate
-            estimate_np = estimate.squeeze().detach().cpu().numpy()
-            axes[1, idx].imshow(estimate_np, cmap='gray')
-            axes[1, idx].set_title(f'Estimate {v.upper()} (NCC: {ncc_losses[idx].item():.4f}, DSC: {dsc_losses[idx].item():.4f})')
-            axes[1, idx].axis('off')
+        # plot current estimate
+        estimate_np = estimate.squeeze().detach().cpu().numpy()
+        axes[1].imshow(estimate_np, cmap='gray')
+        axes[1].set_title(f'Estimate (NCC: {ncc_losses.item():.4f}, DSC: {dsc_losses.item():.4f})')
+        axes[1].axis('off')
 
         plt.tight_layout()
         plt.savefig(self.image_dir / f'iteration_{self.current_iter:04d}.png', dpi=150, bbox_inches='tight')
@@ -263,72 +234,64 @@ class BiplanarReg(nn.Module):
 
     @time_it
     def fit(self):
-        ncc = {'lat': [], 'pa': []}
-        dsc = {'lat': [], 'pa': []}
-        params = {'lat': {'rot': [], 'tra': []},
-                  'pa': {'rot': [], 'tra': []}}
+        ncc = []
+        dsc = []
+        params = {'rot': [], 'tra': []}
         
         # initial loss
-        ncc_losses, dsc_losses = self._compute_loss()
-        for i, v in enumerate(['lat', 'pa']):
-            ncc[v].append(ncc_losses[i].item())
-            dsc[v].append(dsc_losses[i].item())
+        ncc_loss, dsc_loss = self._compute_loss()
+        
+        ncc.append(ncc_loss.item())
+        dsc.append(dsc_loss.item())
 
         # track best
-        ncc_best = {v: ncc[v][0] for v in ['lat', 'pa']}
-        dsc_best = {v: dsc[v][0] for v in ['lat', 'pa']}
-        rot_best = {v: self._extract_parameters(v)[0] for v in ['lat', 'pa']}
-        tra_best = {v: self._extract_parameters(v)[1] for v in ['lat', 'pa']}
+        ncc_best = ncc[0]
+        dsc_best = dsc[0]
+        rot_best = self._extract_parameters()[0]
+        tra_best = self._extract_parameters()[1]
+
         for i in range(1, self.config.num_iter + 1):
             self.current_iter = i
 
-            for v in ['lat', 'pa']:
-                rot, tra = self._extract_parameters(v)
-                params[v]['rot'].append(rot)
-                params[v]['tra'].append(tra)
+            rot, tra = self._extract_parameters()
+            params['rot'].append(rot)
+            params['tra'].append(tra)
 
             if i == 1:
                 logging.info(f"Initial parameters:")
-                for v in ['lat', 'pa']:
-                    logging.info(f"  {v.upper()}:")
-                    logging.info(f"    NCC initial: {ncc_best[v]:.4f}")
-                    logging.info(f"    DSC initial: {dsc_best[v]:.4f}")
-                    logging.info(f"    Rotation (alpha, beta, gamma): {rot_best[v]}")
-                    logging.info(f"    Translation (bx, by, bz): {tra_best[v]}")
+                logging.info(f"    NCC initial: {ncc_best:.4f}")
+                logging.info(f"    DSC initial: {dsc_best:.4f}")
+                logging.info(f"    Rotation (alpha, beta, gamma): {rot_best}")
+                logging.info(f"    Translation (bx, by, bz): {tra_best}")
 
             # optimization step
             self.optimizer.zero_grad()
 
-            ncc_losses, dsc_losses = self._compute_loss()
+            ncc_loss, dsc_loss = self._compute_loss()
             loss = 0.0
-            for ncc_loss, dsc_loss in zip(ncc_losses, dsc_losses):
-                loss += self.config.alpha * ncc_loss + (1 - self.config.alpha) * dsc_loss
-            if self.config.lambda_so3 > 0:
-                reg_so3 = torch.abs(self._geodesic_distance_so3() - (torch.pi / 2))
-                loss += self.config.lambda_so3 * reg_so3
+            loss += self.config.alpha * ncc_loss + (1 - self.config.alpha) * dsc_loss
 
             loss.backward()
             self.optimizer.step()
             self.scheduler.step()
 
             # plot
-            self._plot(ncc_losses, dsc_losses)
+            self._plot(ncc_loss, dsc_loss)
 
             # log
-            for j, v in enumerate(['lat', 'pa']):
-                ncc[v].append(ncc_losses[j].item())
-                dsc[v].append(dsc_losses[j].item())
+            ncc.append(ncc_loss.item())
+            dsc.append(dsc_loss.item())
 
-                rot, tra = self._extract_parameters(v)
-                params[v]['rot'].append(rot)
-                params[v]['tra'].append(tra)
+            rot, tra = self._extract_parameters()
+            params['rot'].append(rot)
+            params['tra'].append(tra)
 
-                if ncc_losses[j].item() < ncc_best[v]:
-                    ncc_best[v] = ncc_losses[j].item()
-                    dsc_best[v] = dsc_losses[j].item()
-                    rot_best[v], tra_best[v] = self._extract_parameters(v)
-                    logging.info(f"Iter {i}: New best NCC for {v.upper()}: {ncc_best[v]:.4f}")
-                    logging.info(f"         DSC: {dsc_best[v]:.4f}")
+            if ncc_loss.item() < ncc_best:
+                ncc_best = ncc_loss.item()
+                dsc_best = dsc_loss.item()
+                rot_best, tra_best = self._extract_parameters()
+                logging.info(f"Iter {i}: New best NCC: {ncc_best:.4f}")
+                logging.info(f"          DSC: {dsc_best:.4f}")
 
         # save best parameters to JSON
         best_params = {
