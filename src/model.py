@@ -105,7 +105,7 @@ class FluoresenceReg(nn.Module):
         imgs, msks = None, None
 
         img = Image.open(paths[0]).convert('L')
-        img = PIL.ImageOps.invert(img)
+        img = PIL.ImageOps.invert(img) # Invert fluor scan as it has inverse colors to DRR
         img = np.asarray(img)
 
         # calculate metrics over valid region
