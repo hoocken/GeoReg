@@ -25,7 +25,7 @@ class ISLES2024Dataset(Dataset):
         self.root = Path(config.root)
 
         # get ids
-        self.id_list = self.root.glob('CTATr/sub-scan*_0000.nii.gz')
+        self.id_list = self.root.glob('CTATr/sub-*_0000.nii.gz')
         self.id_list = [p.name.split('_')[0] for p in self.id_list]
         self.id_list.sort()
 
