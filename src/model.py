@@ -9,7 +9,8 @@ import shutil
 import time
 import torch
 import torch.nn as nn
-import PIL.ImageOps
+import torchio as tio
+from torchvision.transforms import v2
 
 from diffdrr.data import read
 from diffdrr.drr import convert, DRR
@@ -21,7 +22,7 @@ from scipy.ndimage import label
 from skimage.transform import resize
 from torch.optim import *
 from torch.optim.lr_scheduler import *
-from .data import sitk_to_numpy
+from .data import get_masks_per_channel, get_scan_from_nifti
 from PIL import Image
 
 # try to import bilateral_filter_layer, fall back to cv2 if not available
@@ -96,44 +97,44 @@ class FluoresenceReg(nn.Module):
         self.scheduler = eval(config.scheduler)(self.optimizer, **(config.scheduler_kwargs or {}))
         
     def _get_fluor_paths(self, id_dict):
-        img_paths = str(id_dict['Fluor']) + '.png'
-        msk_paths = str(id_dict['Fluor_mask']) + '.png'
+        img_paths = str(id_dict['Fluor']) + '.nii.gz'
+        msk_paths = str(id_dict['Fluor_mask']) + '.nii.gz'
         meta_paths = str(id_dict['Fluor_metadata']) + '.json'
         return img_paths, msk_paths, meta_paths
 
     def _prepare_fluor_data(self, paths):
         imgs, msks = None, None
 
-        img = Image.open(paths[0]).convert('L')
-        img = PIL.ImageOps.invert(img) # Invert fluor scan as it has inverse colors to DRR
-        img = np.asarray(img)
+        # Get img and masks as numpy
+        img = get_scan_from_nifti(paths[0]).to(device=self.device) # (H, W)
+        labelmap, msk = get_masks_per_channel(paths[1], labels=range(74)) # TODO: Autodetect amount of labels here
+        msk = msk.to(device=self.device) # (C, H, W)
 
         # calculate metrics over valid region
-        vmin, vmax = np.percentile(img, [25, 75])
+        q = torch.Tensor([0.25, 0.75]).to(device=self.device)
+        vmin, vmax = torch.quantile(img, q)
         if vmin == vmax:
             vmax += 40
 
-        msk = Image.open(paths[1]).convert('L')
-        msk = np.asarray(msk)
-
         # get largest mask component
-        labeled, _ = label(msk)
-        component_sizes = np.bincount(labeled.ravel())[1:]
-        largest_component = np.argmax(component_sizes) + 1
-        msk = (labeled == largest_component).astype(float)
+        labeled, _ = label(labelmap)
+        # component_sizes = np.bincount(labeled.ravel())[1:]
+        # largest_component = np.argmax(component_sizes) + 1
+        # msk = (labeled == largest_component).astype(float)
 
         # norm
-        img = np.clip(img, vmin, vmax)
-        img -= np.min(img)
-
+        img = torch.clip(img, vmin, vmax)
+        img -= torch.min(img)
 
         # reshape
         if img.shape != self.config.detector_size:
-            img = resize(img, self.config.detector_size, preserve_range=True, anti_aliasing=True)
-            msk = resize(msk, self.config.detector_size, preserve_range=True, anti_aliasing=False)
+            img = v2.Resize(self.config.detector_size, antialias=True)(img[None]).squeeze()
+            msk = v2.Resize(self.config.detector_size, antialias=True)(msk)
 
         # filter - use bilateral_filter_layer if available, otherwise cv2
         if HAS_BILATERAL_LAYER and self.layer is not None:
+            # TODO: Adapt this for new imgs
+            raise NotImplementedError
             img = torch.tensor(img, device=self.device, dtype=torch.float32)[None, None, None]
             msk_tensor = torch.tensor(msk, device=self.device, dtype=torch.float32)[None, None]
             with torch.no_grad():
@@ -141,10 +142,10 @@ class FluoresenceReg(nn.Module):
             imgs = img
             msks = msk_tensor
         else:
-            img = cv2.bilateralFilter(img.astype(np.float32), *self.config.sigmas)
-            img *= msk
+            img = cv2.bilateralFilter(img.cpu().numpy().astype(np.float32), *self.config.sigmas)
+            # img *= msk # TODO: Uncomment this, and use `labeled` to cut out background
             imgs = torch.tensor(img, device=self.device, dtype=torch.float32)[None, None]
-            msks = torch.tensor(msk, device=self.device, dtype=torch.float32)[None, None]
+            msks = msk[None]
 
         return imgs, msks
     
@@ -176,9 +177,8 @@ class FluoresenceReg(nn.Module):
         ncc_loss = -self.criterion(self.fluor, estimate.sum(dim=1, keepdim=True))
 
         # dice loss
-        msk_target = (self.fluor_mask > 0).float()
-        estimate_pred = torch.sigmoid(estimate[:, 1:2]) # this should pick the second channel, bcs of mask_to_channels=True
-        dsc_loss = self.dice_loss(estimate_pred, msk_target)
+        estimate_pred = torch.sigmoid(estimate[:, 1:]) # this should pick the second channel, bcs of mask_to_channels=True
+        dsc_loss = self.dice_loss(estimate_pred, self.fluor_mask)
 
         return ncc_loss, dsc_loss
 

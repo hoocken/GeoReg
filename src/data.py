@@ -1,6 +1,8 @@
 # import necessary libraries
 import numpy as np
 import SimpleITK as sitk
+import torchio as tio
+import torch
 
 from pathlib import Path
 from torch.utils.data import Dataset
@@ -17,6 +19,22 @@ def sitk_to_numpy(filename):
 
     image = sitk.GetArrayFromImage(image)
     return image, spacing, offset
+
+def get_masks_per_channel(filename, labels: list = None):
+    labelmap, _, _ = sitk_to_numpy(filename)
+
+    if labels is None:
+        labels = torch.arange(labelmap.max())
+        
+    masks = torch.stack([ torch.tensor(labelmap.squeeze() == idx) for idx in labels])
+
+    return labelmap, masks
+
+def get_scan_from_nifti(filename):
+    image, _, _ = sitk_to_numpy(filename)
+    image = torch.tensor(image[0]) # get first slice always 
+
+    return image
 
 
 class ISLES2024Dataset(Dataset):
