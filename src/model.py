@@ -106,9 +106,9 @@ class FluoresenceReg(nn.Module):
         imgs, msks = None, None
 
         # Get img and masks as numpy
-        img = get_scan_from_nifti(paths[0]).to(device=self.device) # (H, W)
+        img = torch.flip(get_scan_from_nifti(paths[0]).to(device=self.device), [0]) # (H, W)
         labelmap, msk = get_masks_per_channel(paths[1], labels=range(74)) # TODO: Autodetect amount of labels here
-        msk = msk.to(device=self.device) # (C, H, W)
+        msk = torch.flip(msk.to(device=self.device), [0]) # (C, H, W)
 
         # calculate metrics over valid region
         q = torch.Tensor([0.25, 0.75]).to(device=self.device)
@@ -177,8 +177,8 @@ class FluoresenceReg(nn.Module):
         ncc_loss = -self.criterion(self.fluor, estimate.sum(dim=1, keepdim=True))
 
         # dice loss
-        estimate_pred = torch.sigmoid(estimate[:, 1:30]) # this should pick the second channel, bcs of mask_to_channels=True
-        dsc_loss = self.dice_loss(estimate_pred, self.fluor_mask[:, 1:30])
+        estimate_pred = torch.sigmoid(estimate[:, 1:]) # this should pick the second channel, bcs of mask_to_channels=True
+        dsc_loss = self.dice_loss(estimate_pred, self.fluor_mask[:, 1:])
         return ncc_loss, dsc_loss
 
     def _plot(self, ncc_losses, dsc_losses):
