@@ -9,7 +9,7 @@ model:
         patch_weights: [0.5, 0.5]
     criterion_msk: GeneralizedDiceLoss
     detector_dist: 400
-    detector_size: [84, 256]
+    detector_size: [256, 256]
     detector_spacing: [1.2, 1.2]
     lambda_so3: 0
     multiplier: 1000

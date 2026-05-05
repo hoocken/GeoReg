@@ -32,7 +32,7 @@ def get_masks_per_channel(filename, labels: list = None):
 
 def get_scan_from_nifti(filename):
     image, _, _ = sitk_to_numpy(filename)
-    image = torch.tensor(image[0]) # get first slice always 
+    image = torch.tensor(image[0], dtype=torch.float) # get first slice always 
 
     return image
 

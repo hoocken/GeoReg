@@ -71,7 +71,7 @@ class FluoresenceReg(nn.Module):
 
         # load data
         paths = self._get_fluor_paths(id_dict)
-        cta = read(id_dict['CTA'], id_dict['CTA_mask'], labels=[0, 1])
+        cta = read(id_dict['CTA'], id_dict['CTA_mask'])
         self.fluor, self.fluor_mask = self._prepare_fluor_data(paths)
 
         self.dists = {}
@@ -177,9 +177,8 @@ class FluoresenceReg(nn.Module):
         ncc_loss = -self.criterion(self.fluor, estimate.sum(dim=1, keepdim=True))
 
         # dice loss
-        estimate_pred = torch.sigmoid(estimate[:, 1:]) # this should pick the second channel, bcs of mask_to_channels=True
-        dsc_loss = self.dice_loss(estimate_pred, self.fluor_mask)
-
+        estimate_pred = torch.sigmoid(estimate[:, 1:30]) # this should pick the second channel, bcs of mask_to_channels=True
+        dsc_loss = self.dice_loss(estimate_pred, self.fluor_mask[:, 1:30])
         return ncc_loss, dsc_loss
 
     def _plot(self, ncc_losses, dsc_losses):
