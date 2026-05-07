@@ -6,7 +6,7 @@ import torch
 
 from pathlib import Path
 from torch.utils.data import Dataset
-
+from torch import Tensor
 
 def sitk_to_numpy(filename):
     image = sitk.ReadImage(filename)
@@ -20,22 +20,50 @@ def sitk_to_numpy(filename):
     image = sitk.GetArrayFromImage(image)
     return image, spacing, offset
 
-def get_masks_per_channel(filename, labels: list = None):
+def get_masks_per_channel(filename, labels: list = None) -> tuple[Tensor, Tensor]:
+    """
+    Opens `filename` as nii.gz and returns the labelmap as (H, W)
+    and separated masks by channel as (C, H, W).
+    """
     labelmap, _, _ = sitk_to_numpy(filename)
 
     if labels is None:
         labels = torch.arange(labelmap.max())
         
     masks = torch.stack([ torch.tensor(labelmap.squeeze() == idx) for idx in labels])
+    labelmap = torch.tensor(labelmap)
 
     return labelmap, masks
 
-def get_scan_from_nifti(filename):
+def get_scan_from_nifti(filename) -> Tensor:
+    """Opens `filename` and returns the first slice of image as tensor (H, W)"""
     image, _, _ = sitk_to_numpy(filename)
     image = torch.tensor(image[0], dtype=torch.float) # get first slice always 
 
     return image
 
+def crop_used_region(image: Tensor) -> tuple[int, int, int, int]:
+    """
+    Crop all used region in an image to a minimal bounding box.
+    
+    Returns left, right, up, down coordinates of rectangle.
+    """
+    H, W = image.shape
+    temp = (image != 0).to(torch.float)
+    
+    left_margins = torch.argmax(temp, 1)
+    left = torch.min(left_margins[left_margins>0])
+
+    right_margins = torch.argmax(torch.flip(temp, [1]), 1)
+    right = torch.min(right_margins[right_margins>0])
+
+    up_margins = torch.argmax(temp, 0)
+    up = torch.min(up_margins[up_margins>0])
+
+    down_margins = torch.argmax(torch.flip(temp, [0]), 0)
+    down = torch.min(down_margins[down_margins>0])
+    
+    return left, W - right, up, H - down
 
 class ISLES2024Dataset(Dataset):
     def __init__(self, config):

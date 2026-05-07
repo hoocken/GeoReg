@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import torchio as tio
 from torchvision.transforms import v2
+from torch import Tensor
 
 from diffdrr.data import read
 from diffdrr.drr import convert, DRR
@@ -22,7 +23,7 @@ from scipy.ndimage import label
 from skimage.transform import resize
 from torch.optim import *
 from torch.optim.lr_scheduler import *
-from .data import get_masks_per_channel, get_scan_from_nifti
+from .data import get_masks_per_channel, get_scan_from_nifti, crop_used_region, sitk_to_numpy
 from PIL import Image
 
 # try to import bilateral_filter_layer, fall back to cv2 if not available
@@ -54,7 +55,7 @@ class FluoresenceReg(nn.Module):
         super().__init__()
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+        
         # initialize bilateral filter layer if available
         if HAS_BILATERAL_LAYER:
             self.layer = BilateralFilter3d(*config.sigmas, use_gpu=torch.cuda.is_available()).to(self.device)
@@ -71,9 +72,10 @@ class FluoresenceReg(nn.Module):
 
         # load data
         paths = self._get_fluor_paths(id_dict)
-        cta = read(id_dict['CTA'], id_dict['CTA_mask'])
-        self.fluor, self.fluor_mask = self._prepare_fluor_data(paths)
-
+        cta = read(id_dict['CTA'], id_dict['CTA_mask'], labels=range(74))
+        fluor, labelmap, fluor_mask = self._get_fluor_images(paths)
+        self.common_masks_index = self._get_common_channels(cta.mask.data, labelmap)
+        self.fluor, self.fluor_mask = self._prepare_fluor_data(fluor, fluor_mask, labelmap, self.common_masks_index) 
         self.dists = {}
         self.drrs = {}
         self.params = nn.ParameterDict()
@@ -85,7 +87,9 @@ class FluoresenceReg(nn.Module):
         self.drrs = DRR(cta, sdd=metadata['DistanceSourceToDetector'],
                             height=config.detector_size[0], width=config.detector_size[1], delx=config.detector_spacing[0],
                             stop_gradients_through_grid_sample=True).to(self.device)
-        self.params = self._initialize_params()
+        
+        mean_mask_center = self._get_mean_center(cta.mask, self.common_masks_index)
+        self.params = self._initialize_params(mean_mask_center)
 
         # loss
         self.criterion = eval(config.criterion_img)(**(config.criterion_img_kwargs or {}))
@@ -102,13 +106,31 @@ class FluoresenceReg(nn.Module):
         meta_paths = str(id_dict['Fluor_metadata']) + '.json'
         return img_paths, msk_paths, meta_paths
 
-    def _prepare_fluor_data(self, paths):
-        imgs, msks = None, None
+    def _get_common_channels(self, input: Tensor, target: Tensor) -> Tensor:
+        input_channels = torch.bincount(input.ravel()).nonzero(as_tuple=True)[0].int()[1:]
+        target_channels = torch.bincount(target.ravel()).nonzero(as_tuple=True)[0].int()[1:]
 
+        channels = list(set(target_channels.tolist()) & set(input_channels.tolist()))
+        return torch.tensor(channels, device=self.device, dtype=int)
+
+    def _get_fluor_images(self, paths: list) -> tuple[Tensor, Tensor, Tensor]:
         # Get img and masks as numpy
-        img = torch.flip(get_scan_from_nifti(paths[0]).to(device=self.device), [0]) # (H, W)
-        labelmap, msk = get_masks_per_channel(paths[1], labels=range(74)) # TODO: Autodetect amount of labels here
-        msk = torch.flip(msk.to(device=self.device), [0]) # (C, H, W)
+        img = torch.flip(get_scan_from_nifti(paths[0]).to(device=self.device), [0, 1]) # (H, W)
+        img = img.max() - img # invert colors
+
+        labelmap, msk = get_masks_per_channel(paths[1], labels=range(73)) # TODO: Autodetect amount of labels here
+        msk = torch.flip(msk.to(device=self.device), [1, 2]) # (C, H, W)
+
+        return img, labelmap, msk
+
+    def _prepare_fluor_data(self, img: Tensor, msk: Tensor, labelmap: Tensor, channels: Tensor) -> tuple[Tensor, Tensor]:
+        imgs, msks = None, None
+        
+        # Crop msk and image to only contain elements in CTA
+        used_msk = torch.sum(msk[channels], 0) # Flatten all used mask channel to one tensor
+        left, right, up, down = crop_used_region(used_msk)
+        img = img[up:down, left:right]
+        msk = msk[:, up:down, left:right]
 
         # calculate metrics over valid region
         q = torch.Tensor([0.25, 0.75]).to(device=self.device)
@@ -148,10 +170,30 @@ class FluoresenceReg(nn.Module):
             msks = msk[None]
 
         return imgs, msks
+
+    def _get_mean_center(self, mask: tio.LabelMap, channels: Tensor) -> Tensor:
+        """
+        Get mean center of nonzero elements in mask.
+        Returns a tensor with [x, y, z]
+        """
+        spacing = torch.tensor(list(mask.spacing), device=self.device)
+        image = mask.data
+
+        image = image.to(device=self.device)
+        _, W, H, D = image.shape
+        image = torch.stack(
+            [image == i for i in channels]
+        ).sum(dim=0) # Collect all mask of channels into one
+
+        # Flip tensor first as images loaded through ScalarImage has its origin at bottom
+        nonzero_indices = torch.flip(image, [1, 2, 3]).nonzero().float()
+
+        center_mean = (nonzero_indices.mean(dim=0)[1:] - torch.tensor([W, H, D], device=self.device) / 2) # Center the mean as origin is at center of volume
+        return center_mean * spacing
     
-    def _initialize_params(self):    
+    def _initialize_params(self, tra: Tensor):
         rot_init = [[0, 0, 0]]    
-        tra_init = [[0, self.dists, 0]]
+        tra_init = [[-tra[0], self.dists, -tra[2]]]
 
         rot_init = torch.tensor(rot_init, device=self.device, dtype=torch.float32) / 180 * torch.pi
         tra_init = torch.tensor(tra_init, device=self.device, dtype=torch.float32) / self.config.multiplier
@@ -177,8 +219,10 @@ class FluoresenceReg(nn.Module):
         ncc_loss = -self.criterion(self.fluor, estimate.sum(dim=1, keepdim=True))
 
         # dice loss
-        estimate_pred = torch.sigmoid(estimate[:, 1:]) # this should pick the second channel, bcs of mask_to_channels=True
-        dsc_loss = self.dice_loss(estimate_pred, self.fluor_mask[:, 1:])
+        estimate_pred_common = estimate[:, self.common_masks_index]
+        fluor_mask_common = self.fluor_mask[:, self.common_masks_index]
+        estimate_pred = torch.sigmoid(estimate_pred_common) # this should pick the second channel, bcs of mask_to_channels=True
+        dsc_loss = self.dice_loss(estimate_pred_common, fluor_mask_common)
         return ncc_loss, dsc_loss
 
     def _plot(self, ncc_losses, dsc_losses):
