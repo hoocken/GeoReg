@@ -73,9 +73,9 @@ class FluoresenceReg(nn.Module):
         # load data
         paths = self._get_fluor_paths(id_dict)
         cta = read(id_dict['CTA'], id_dict['CTA_mask'], labels=range(74))
-        fluor, labelmap, fluor_mask = self._get_fluor_images(paths)
-        self.common_masks_index = self._get_common_channels(cta.mask.data, labelmap)
-        self.fluor, self.fluor_mask = self._prepare_fluor_data(fluor, fluor_mask, labelmap, self.common_masks_index) 
+        fluor, fluor_mask = self._get_fluor_images(paths)
+        self.common_masks_index = self._get_common_channels(cta.mask.data, fluor_mask)
+        self.fluor, self.fluor_mask = self._prepare_fluor_data(fluor, fluor_mask, self.common_masks_index) 
         self.dists = {}
         self.drrs = {}
         self.params = nn.ParameterDict()
@@ -102,13 +102,13 @@ class FluoresenceReg(nn.Module):
         
     def _get_fluor_paths(self, id_dict):
         img_paths = str(id_dict['Fluor']) + '.nii.gz'
-        msk_paths = str(id_dict['Fluor_mask']) + '.nii.gz'
+        msk_paths = str(id_dict['Fluor_mask']) + '.npy'
         meta_paths = str(id_dict['Fluor_metadata']) + '.json'
         return img_paths, msk_paths, meta_paths
 
     def _get_common_channels(self, input: Tensor, target: Tensor) -> Tensor:
         input_channels = torch.bincount(input.ravel()).nonzero(as_tuple=True)[0].int()[1:]
-        target_channels = torch.bincount(target.ravel()).nonzero(as_tuple=True)[0].int()[1:]
+        target_channels = torch.any(target, dim=(-1, -2)).nonzero(as_tuple=True)[0].int()[1:]
 
         channels = list(set(target_channels.tolist()) & set(input_channels.tolist()))
         return torch.tensor(channels, device=self.device, dtype=int)
@@ -118,12 +118,11 @@ class FluoresenceReg(nn.Module):
         img = torch.flip(get_scan_from_nifti(paths[0]).to(device=self.device), [0, 1]) # (H, W)
         img = img.max() - img # invert colors
 
-        labelmap, msk = get_masks_per_channel(paths[1], labels=range(73)) # TODO: Autodetect amount of labels here
-        msk = torch.flip(msk.to(device=self.device), [1, 2]) # (C, H, W)
+        msk = torch.tensor(np.load(paths[1])).to(device=self.device)
 
-        return img, labelmap, msk
+        return img, msk
 
-    def _prepare_fluor_data(self, img: Tensor, msk: Tensor, labelmap: Tensor, channels: Tensor) -> tuple[Tensor, Tensor]:
+    def _prepare_fluor_data(self, img: Tensor, msk: Tensor, channels: Tensor) -> tuple[Tensor, Tensor]:
         imgs, msks = None, None
         
         # Crop msk and image to only contain elements in CTA
@@ -139,7 +138,7 @@ class FluoresenceReg(nn.Module):
             vmax += 40
 
         # get largest mask component
-        labeled, _ = label(labelmap)
+        # labeled, _ = label(labelmap)
         # component_sizes = np.bincount(labeled.ravel())[1:]
         # largest_component = np.argmax(component_sizes) + 1
         # msk = (labeled == largest_component).astype(float)
@@ -181,9 +180,9 @@ class FluoresenceReg(nn.Module):
 
         image = image.to(device=self.device)
         _, W, H, D = image.shape
-        image = torch.stack(
-            [image == i for i in channels]
-        ).sum(dim=0) # Collect all mask of channels into one
+        print(W, H, D, channels)
+
+        image = torch.isin(image, channels)
 
         # Flip tensor first as images loaded through ScalarImage has its origin at bottom
         nonzero_indices = torch.flip(image, [1, 2, 3]).nonzero().float()
