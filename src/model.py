@@ -180,7 +180,6 @@ class FluoresenceReg(nn.Module):
 
         image = image.to(device=self.device)
         _, W, H, D = image.shape
-        print(W, H, D, channels)
 
         image = torch.isin(image, channels)
 
@@ -218,10 +217,22 @@ class FluoresenceReg(nn.Module):
         ncc_loss = -self.criterion(self.fluor, estimate.sum(dim=1, keepdim=True))
 
         # dice loss
+        # 1. Get nonzero regions
+        nonzero_mask = estimate > 0
         estimate_pred_common = estimate[:, self.common_masks_index]
+
+        # 2. Mask fluor masks
         fluor_mask_common = self.fluor_mask[:, self.common_masks_index]
-        estimate_pred = torch.sigmoid(estimate_pred_common) # this should pick the second channel, bcs of mask_to_channels=True
-        dsc_loss = self.dice_loss(estimate_pred_common, fluor_mask_common)
+        # fluor_mask_common = fluor_mask_common * nonzero_mask[:, self.common_masks_index, :, :]
+        
+
+        # 3. Normalize
+        min = estimate_pred_common.amin(dim=[2, 3], keepdim=True)
+        max = estimate_pred_common.amax(dim=[2, 3], keepdim=True)
+        estimate_pred = (estimate_pred_common - min) / (max - min) # this should pick the second channel, bcs of mask_to_channels=True
+
+        # 4. Calculate dice loss
+        dsc_loss = self.dice_loss(estimate_pred, fluor_mask_common)
         return ncc_loss, dsc_loss
 
     def _plot(self, ncc_losses, dsc_losses):
