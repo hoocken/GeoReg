@@ -1,4 +1,6 @@
 # import necessary libraries
+import sys
+
 import cv2
 import hydra
 import json
@@ -76,6 +78,10 @@ class FluoresenceReg(nn.Module):
         fluor, fluor_mask = self._get_fluor_images(paths)
         self.common_masks_index = self._get_common_channels(cta.mask.data, fluor_mask)
         self.fluor, self.fluor_mask = self._prepare_fluor_data(fluor, fluor_mask, self.common_masks_index) 
+
+        if not self.config.use_truncated:
+            self.common_masks_index = self._get_nontruncated_segmentations(cta.mask.data, self.common_masks_index)
+
         self.dists = {}
         self.drrs = {}
         self.params = nn.ParameterDict()
@@ -83,11 +89,13 @@ class FluoresenceReg(nn.Module):
         with open(paths[2]) as f:
             metadata = json.load(f)
 
-        self.dists = metadata['DistanceSourceToDetector'] - config.detector_dist # what is detector_dist?
+        self.dists = metadata['DistanceSourceToDetector'] - self.config.detector_dist # what is detector_dist?
         self.drrs = DRR(cta, sdd=metadata['DistanceSourceToDetector'],
-                            height=config.detector_size[0], width=config.detector_size[1], delx=config.detector_spacing[0],
+                            height=self.config.detector_size[0], width=self.config.detector_size[1], delx=self.config.detector_spacing[0],
                             stop_gradients_through_grid_sample=True).to(self.device)
         
+        self.common_masks_index = self.common_masks_index.to(self.device)
+
         mean_mask_center = self._get_mean_center(cta.mask, self.common_masks_index)
         self.params = self._initialize_params(mean_mask_center)
 
@@ -111,8 +119,25 @@ class FluoresenceReg(nn.Module):
         target_channels = torch.any(target, dim=(-1, -2)).nonzero(as_tuple=True)[0].int()[1:]
 
         channels = list(set(target_channels.tolist()) & set(input_channels.tolist()))
-        return torch.tensor(channels, device=self.device, dtype=int)
+        return torch.tensor(channels, dtype=int)
 
+    def _get_nontruncated_segmentations(self, input: Tensor, channels: Tensor) -> Tensor:
+        """
+        Filter segmentations further to remove all segmentations from 3D mask that touches the edges.
+        This is classified as incomplete segmentations.
+        """
+        filtered_channels = []
+        for i in channels:
+            mask = input == i
+            mask = mask[0]
+
+            mask = mask[:, :, 0]
+
+            if torch.count_nonzero(mask) == 0:
+                filtered_channels.append(i)
+
+        return torch.tensor(filtered_channels, dtype=int) 
+                
     def _get_fluor_images(self, paths: list) -> tuple[Tensor, Tensor, Tensor]:
         # Get img and masks as numpy
         img = torch.flip(get_scan_from_nifti(paths[0]).to(device=self.device), [0, 1]) # (H, W)
@@ -137,18 +162,14 @@ class FluoresenceReg(nn.Module):
         if vmin == vmax:
             vmax += 40
 
-        # get largest mask component
-        # labeled, _ = label(labelmap)
-        # component_sizes = np.bincount(labeled.ravel())[1:]
-        # largest_component = np.argmax(component_sizes) + 1
-        # msk = (labeled == largest_component).astype(float)
-
         # norm
         img = torch.clip(img, vmin, vmax)
         img -= torch.min(img)
 
         # reshape
         if img.shape != self.config.detector_size:
+            # self.config.detector_size[0] = img.shape[0]
+            # self.config.detector_size[1] = img.shape[1]
             img = v2.Resize(self.config.detector_size, antialias=True)(img[None]).squeeze()
             msk = v2.Resize(self.config.detector_size, antialias=True)(msk)
 
@@ -183,10 +204,22 @@ class FluoresenceReg(nn.Module):
 
         image = torch.isin(image, channels)
 
+        # Get mean center of fluor mask
+        fluor_mask_common = self.fluor_mask[:, channels]
+        fluor_mask_nonzero = fluor_mask_common.nonzero().float()
+        fluor_mask_mean = fluor_mask_nonzero.mean(dim=0)[2:]
+
+        # Calculate offset from center 
+        fluor_trans = fluor_mask_mean * (W / self.fluor_mask.shape[2]) - torch.tensor([H, W], device=self.device) / 2
+
         # Flip tensor first as images loaded through ScalarImage has its origin at bottom
         nonzero_indices = torch.flip(image, [1, 2, 3]).nonzero().float()
-
         center_mean = (nonzero_indices.mean(dim=0)[1:] - torch.tensor([W, H, D], device=self.device) / 2) # Center the mean as origin is at center of volume
+
+        # Position CTA such that its mean overlaps the center mean of the fluor mask
+        center_mean[0] -= fluor_trans[1]
+        center_mean[2] -= fluor_trans[0]
+
         return center_mean * spacing
     
     def _initialize_params(self, tra: Tensor):
@@ -213,26 +246,14 @@ class FluoresenceReg(nn.Module):
         rot, tra = self._extract_parameters(False, False)
         estimate = self.drrs(rot, tra, parameterization='euler_angles',
                                 convention='ZYX', mask_to_channels=True)
-        # ncc loss
-        ncc_loss = -self.criterion(self.fluor, estimate.sum(dim=1, keepdim=True))
+        # ncc loss (normalized to [0, 1])
+        ncc_loss = (-self.criterion(self.fluor, estimate.sum(dim=1, keepdim=True)) + 1) / 2
 
         # dice loss
-        # 1. Get nonzero regions
-        nonzero_mask = estimate > 0
         estimate_pred_common = estimate[:, self.common_masks_index]
-
-        # 2. Mask fluor masks
         fluor_mask_common = self.fluor_mask[:, self.common_masks_index]
-        # fluor_mask_common = fluor_mask_common * nonzero_mask[:, self.common_masks_index, :, :]
-        
-
-        # 3. Normalize
-        min = estimate_pred_common.amin(dim=[2, 3], keepdim=True)
-        max = estimate_pred_common.amax(dim=[2, 3], keepdim=True)
-        estimate_pred = (estimate_pred_common - min) / (max - min) # this should pick the second channel, bcs of mask_to_channels=True
-
-        # 4. Calculate dice loss
-        dsc_loss = self.dice_loss(estimate_pred, fluor_mask_common)
+        estimate_pred = torch.tanh(estimate_pred_common) # use tanh to scale output from [0, inf) to [0, 1]
+        dsc_loss = self.dice_loss(estimate_pred.to(torch.float), fluor_mask_common.to(torch.float))
         return ncc_loss, dsc_loss
 
     def _plot(self, ncc_losses, dsc_losses):
