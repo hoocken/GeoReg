@@ -123,15 +123,15 @@ class FluoresenceReg(nn.Module):
 
     def _get_nontruncated_segmentations(self, input: Tensor, channels: Tensor) -> Tensor:
         """
-        Filter segmentations further to remove all segmentations from 3D mask that touches the edges.
-        This is classified as incomplete segmentations.
+        Filter segmentations further to remove all segmentations from 3D mask that touches the *bottom* edge.
+        These are classified as incomplete segmentations.
         """
         filtered_channels = []
         for i in channels:
             mask = input == i
             mask = mask[0]
 
-            mask = mask[:, :, 0]
+            mask = mask[:, :, 0] # check bottom edge
 
             if torch.count_nonzero(mask) == 0:
                 filtered_channels.append(i)
