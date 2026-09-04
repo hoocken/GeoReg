@@ -175,17 +175,14 @@ class FluoresenceReg(nn.Module):
 
         # filter - use bilateral_filter_layer if available, otherwise cv2
         if HAS_BILATERAL_LAYER and self.layer is not None:
-            # TODO: Adapt this for new imgs
-            raise NotImplementedError
             img = torch.tensor(img, device=self.device, dtype=torch.float32)[None, None, None]
             msk_tensor = torch.tensor(msk, device=self.device, dtype=torch.float32)[None, None]
             with torch.no_grad():
-                img = self.layer(img)[:, :, 0] * msk_tensor
+                img = self.layer(img)[:, :, 0]
             imgs = img
             msks = msk_tensor
         else:
             img = cv2.bilateralFilter(img.cpu().numpy().astype(np.float32), *self.config.sigmas)
-            # img *= msk # TODO: Uncomment this, and use `labeled` to cut out background
             imgs = torch.tensor(img, device=self.device, dtype=torch.float32)[None, None]
             msks = msk[None]
 
