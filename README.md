@@ -37,10 +37,10 @@ uv run main.py
 ```
 
 ### CTA Segmentation
-For CTA Segmentation, we use (VIBESegmentator)[https://github.com/robert-graf/VIBESegmentator]. For tutorial on how to use them, refer to the repository website.
+For CTA Segmentation, we use [VIBESegmentator](https://github.com/robert-graf/VIBESegmentator). For tutorial on how to use them, refer to the repository website.
 
 ### Fluoroscopy Segmentation
-For fluoroscopy segmentation, we use this implementation of (UNet)[https://github.com/hoocken/UNet]. Please refer to the repository for usage instructions.
+For fluoroscopy segmentation, we use this implementation of [UNet](https://github.com/hoocken/UNet). Please refer to the repository for usage instructions.
 
 ### Config
 You can modify how the optimization is run from the configs in `configs`. Primarily, `register_local.yaml` is used, but you can change the path in `main.py`.
