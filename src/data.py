@@ -1,7 +1,6 @@
 # import necessary libraries
 import numpy as np
 import SimpleITK as sitk
-import torchio as tio
 import torch
 
 from pathlib import Path
@@ -10,6 +9,7 @@ from torch import Tensor
 
 def sitk_to_numpy(filename):
     image = sitk.ReadImage(filename)
+    image = sitk.DICOMOrient(image, 'LPS') # Reorient slice
     spacing = image.GetSpacing()
     offset = image.GetOrigin()
 
@@ -86,7 +86,7 @@ class ISLES2024Dataset(Dataset):
         fluor_msk_path = self.root / 'F_maskTr' / id_
         fluor_metadata_path = self.root / 'F_metadataTr' / id_
         cta_path = self.root / 'CTATr' / f'{id_}_0000.nii.gz'
-        cta_msk_path = self.root / 'CTA_skullTr' / f'{id_}.nii.gz'
+        cta_msk_path = self.root / 'CTA_maskTr' / f'{id_}.nii.gz'
 
         return {"Fluor": fluor_path, "Fluor_mask": fluor_msk_path, "Fluor_metadata": fluor_metadata_path,
                 "CTA": cta_path, "CTA_mask": cta_msk_path}

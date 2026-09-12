@@ -25,8 +25,7 @@ from scipy.ndimage import label
 from skimage.transform import resize
 from torch.optim import *
 from torch.optim.lr_scheduler import *
-from .data import get_masks_per_channel, get_scan_from_nifti, crop_used_region, sitk_to_numpy
-from PIL import Image
+from .data import get_scan_from_nifti, crop_used_region
 
 # try to import bilateral_filter_layer, fall back to cv2 if not available
 try:
@@ -136,11 +135,15 @@ class FluoresenceReg(nn.Module):
             if torch.count_nonzero(mask) == 0:
                 filtered_channels.append(i)
 
+        print(filtered_channels)
+        if len(filtered_channels) == 0:
+            raise Exception('No non-truncated segmentations! Set use_truncated to True!')
+
         return torch.tensor(filtered_channels, dtype=int) 
                 
     def _get_fluor_images(self, paths: list) -> tuple[Tensor, Tensor, Tensor]:
         # Get img and masks as numpy
-        img = torch.flip(get_scan_from_nifti(paths[0]).to(device=self.device), [0, 1]) # (H, W)
+        img = get_scan_from_nifti(paths[0]).to(device=self.device) # (H, W)
         img = img.max() - img # invert colors
 
         msk = torch.tensor(np.load(paths[1])).to(device=self.device)
