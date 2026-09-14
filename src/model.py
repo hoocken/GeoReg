@@ -88,7 +88,7 @@ class FluoresenceReg(nn.Module):
         with open(paths[2]) as f:
             metadata = json.load(f)
 
-        self.dists = metadata['DistanceSourceToDetector'] - self.config.detector_dist # what is detector_dist?
+        self.dists = metadata['DistanceSourceToDetector'] - self.config.detector_dist
         self.drrs = DRR(cta, sdd=metadata['DistanceSourceToDetector'],
                             height=self.config.detector_size[0], width=self.config.detector_size[1], delx=self.config.detector_spacing[0],
                             stop_gradients_through_grid_sample=True).to(self.device)
@@ -135,7 +135,6 @@ class FluoresenceReg(nn.Module):
             if torch.count_nonzero(mask) == 0:
                 filtered_channels.append(i)
 
-        print(filtered_channels)
         if len(filtered_channels) == 0:
             raise Exception('No non-truncated segmentations! Set use_truncated to True!')
 
