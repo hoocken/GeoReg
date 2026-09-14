@@ -171,8 +171,8 @@ class FluoresenceReg(nn.Module):
 
         # reshape
         if img.shape != self.config.detector_size:
-            # self.config.detector_size[0] = img.shape[0]
-            # self.config.detector_size[1] = img.shape[1]
+            ratio = img.shape[0] / img.shape[1]
+            self.config.detector_size[0] = int(ratio * self.config.detector_size[1]) # adjust aspect ratio
             img = v2.Resize(self.config.detector_size, antialias=True)(img[None]).squeeze()
             msk = v2.Resize(self.config.detector_size, antialias=True)(msk)
 
