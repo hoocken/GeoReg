@@ -1,4 +1,4 @@
-# GeoReg: Direct Biplanar DSA-to-CTA Registration
+# GeoReg: Registration of CTA and Fluoroscopy Scans
 
 This is a fork of the repository from the MIDL 2026 submission:
 
@@ -22,7 +22,7 @@ data
 ├── CTA_maskTr          # CTA Segmentation
 │   └── sub-*.nii.gz
 ├── CTATr               # CTA Volume
-│   └── sub-*.nii.gz
+│   └── sub-*_0000.nii.gz
 ├── F_maskTr            # Fluoroscopy Segmentation
 │   └── sub-*.npy  
 ├── F_metadataTr        # Fluoroscopy Metadata
@@ -30,8 +30,9 @@ data
 └── FTr                 # Fluoroscopy Scan
     └── sub-*.nii.gz
 ```
+where the input in CTATr must be of the form `sub-*_0000.nii.gz`, with files in other folders following `sub-*.nii.gz`.
 
-To run the program, simply run
+To run the program, simply set the index in `configs/register_local.yaml` to select which data to fit and run
 ```sh
 uv run main.py
 ```
