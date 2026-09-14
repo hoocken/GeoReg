@@ -23,4 +23,4 @@ model:
         total_steps: 400
     sigmas: [25, 11, 25]
     timestamp: pre
-    use_truncated: False # If True, will use non-complete 3D segmentations
+    use_truncated: True # If True, will use non-complete 3D segmentations
